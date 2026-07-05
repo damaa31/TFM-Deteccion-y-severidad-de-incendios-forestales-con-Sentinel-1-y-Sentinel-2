@@ -32,8 +32,12 @@ Los scripts están numerados según el orden de ejecución del flujo de trabajo.
 - `18_cartografia_severidad_fusion.R` — Cartografía de severidad (solo fusión)
 
 ## Requisitos
-- **R** (paquetes principales: `terra`, `ranger`/`randomForest`, `Boruta`, `sf`)
-- **Google Earth Engine** (cuenta propia) para los scripts de preprocesamiento
+* **Google Earth Engine:** Cuenta activa en la plataforma para la ejecución de los *scripts* de la carpeta `00_preprocesamiento_GEE`.
+* **Lenguaje R (>= 4.3.0):** Para la ejecución del modelado estadístico y cartográfico.
+* **Librerías principales de R:**
+  * Tratamiento de datos espaciales y ráster: `terra`, `sf`
+  * Modelización de *Machine Learning*: `ranger`, `randomForest`, `Boruta`
+  * Manipulación de datos: `dplyr`
 
 ## Nota sobre las rutas
 Los scripts emplean rutas absolutas locales (por ejemplo, `G:/TFM/...`) 
