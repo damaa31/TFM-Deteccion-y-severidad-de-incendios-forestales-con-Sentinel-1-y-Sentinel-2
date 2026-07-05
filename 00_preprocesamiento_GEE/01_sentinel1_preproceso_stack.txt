@@ -13,7 +13,7 @@
 // =============================================================================
 
 var perimetros = ee.FeatureCollection(
-  "projects/fit-sanctum-438808-j8/assets/Perimetros_CyL"
+  "Perimetros_incendios"
 );
 
 // JAXA ALOS WORLD 3D V4.1
