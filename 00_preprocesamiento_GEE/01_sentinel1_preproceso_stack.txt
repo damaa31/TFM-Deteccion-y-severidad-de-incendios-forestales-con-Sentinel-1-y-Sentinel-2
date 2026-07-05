@@ -1,0 +1,355 @@
+// =============================================================================
+// SENTINEL-1 v2.2: PREPROCESAMIENTO + STACK SEVERIDAD (IMAGEN ÚNICA POR CONDICIÓN)
+// =============================================================================
+// CAMBIOS v2.2:
+//   - Eliminadas las ventanas fijas de 30/60 días.
+//   - PRE: Selecciona la PRIMERA imagen disponible hacia atrás desde FIREDATE que tenga 0mm de lluvia.
+//   - POST: Selecciona la PRIMERA imagen disponible hacia adelante desde LASTUPDATE+5 días con 0mm de lluvia.
+//   - Impresión en consola de las fechas exactas de las imágenes seleccionadas.
+// =============================================================================
+
+// =============================================================================
+// BLOQUE 1: PREPROCESAMIENTO SENTINEL-1 (MOTOR JAXA ALOS)
+// =============================================================================
+
+var perimetros = ee.FeatureCollection(
+  "projects/fit-sanctum-438808-j8/assets/Perimetros_CyL"
+);
+
+// JAXA ALOS WORLD 3D V4.1
+var dem_raw = ee.ImageCollection("JAXA/ALOS/AW3D30/V4_1")
+  .select('DSM')
+  .mosaic()
+  .setDefaultProjection({crs: 'EPSG:4326', scale: 30});
+
+var dem = dem_raw.focal_mean(1, 'square', 'pixels').unmask(dem_raw);
+
+// PARÁMETROS
+var ENL_USED = 5.0;
+var ORBIT_USED = 'DESCENDING';
+var AZIMUTH_DEG = 283.8;
+
+// TERRAIN
+var terrain = ee.Terrain.products(dem);
+var slope = terrain.select('slope').multiply(Math.PI/180);
+var aspect = terrain.select('aspect').multiply(Math.PI/180);
+
+// HELPER ÁNGULO INCIDENCIA
+var getTheta = function(img) {
+  var hasAngle = img.bandNames().contains('angle');
+  var angleImg = ee.Image(
+    ee.Algorithms.If(
+      hasAngle,
+      img.select('angle'),
+      ee.Image.constant(39)
+    )
+  );
+  return angleImg.unmask(39).multiply(Math.PI/180);
+};
+
+// RTC-LIA
+var toGamma0_RTC = function(img) {
+  var theta_i = getTheta(img);
+  var phi_s = ee.Image.constant(AZIMUTH_DEG * Math.PI/180);
+
+  var cosLIA = theta_i.cos().multiply(slope.cos())
+    .add(theta_i.sin()
+    .multiply(slope.sin())
+    .multiply(phi_s.subtract(aspect).cos()))
+    .max(0.01);
+
+  var gamma0_VH = img.select('VH')
+    .subtract(cosLIA.log10().multiply(10))
+    .rename('VH_gamma0');
+
+  var gamma0_VV = img.select('VV')
+    .subtract(cosLIA.log10().multiply(10))
+    .rename('VV_gamma0');
+
+  return img.addBands([gamma0_VH, gamma0_VV], null, true);
+};
+
+// BORDER NOISE
+var removeBorderNoise = function(img) {
+  return img.updateMask(img.select('VV').gt(-55));
+};
+
+// LEE FILTER
+var leeFilter = function(img) {
+  var vh_db = img.select('VH_gamma0');
+  var vv_db = img.select('VV_gamma0');
+  var vh_linear = ee.Image.constant(10).pow(vh_db.divide(10));
+  var vv_linear = ee.Image.constant(10).pow(vv_db.divide(10));
+  var kernel = ee.Kernel.square(2);
+  var noiseVarFactor = ee.Number(1).divide(ENL_USED);
+
+  var applyLee = function(band) {
+    var mean = band.reduceNeighborhood(ee.Reducer.mean(), kernel);
+    var meanSq = mean.pow(2);
+    var bandSqMean = band.pow(2).reduceNeighborhood(ee.Reducer.mean(), kernel);
+    var variance = bandSqMean.subtract(meanSq).max(1e-12);
+    var noiseVar = meanSq.multiply(noiseVarFactor).max(1e-12);
+    var w = variance.subtract(noiseVar).max(0).divide(variance.max(1e-12)).clamp(0,1);
+    return mean.add(w.multiply(band.subtract(mean)));
+  };
+
+  var vh_filtered = applyLee(vh_linear).max(1e-12).log10().multiply(10).rename('VH_gamma0_filtered');
+  var vv_filtered = applyLee(vv_linear).max(1e-12).log10().multiply(10).rename('VV_gamma0_filtered');
+  return img.addBands([vh_filtered, vv_filtered]);
+};
+
+// FILTRO METEOROLÓGICO CHIRPS (Lluvia 0mm en los 5 días previos)
+var filterDryImages = function(collection, geom) {
+  var chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY");
+
+  var withRain = collection.map(function(img) {
+    var imgDate = img.date();
+    var rainWindow = chirps.filterDate(imgDate.advance(-5, 'day'), imgDate).sum();
+
+    var rainStats = rainWindow.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: 5566,
+      maxPixels: 1e9
+    });
+
+    var rain_mm = ee.Algorithms.If(
+      rainStats.contains('precipitation'),
+      rainStats.getNumber('precipitation'),
+      ee.Number(0)
+    );
+
+    return img.set('rain_5d_mm', rain_mm);
+  });
+
+  return withRain.filter(ee.Filter.eq('rain_5d_mm', 0));
+};
+
+// PROCESAR INCENDIO
+var procesarFuego = function(feature) {
+  var start = ee.Date.parse('YYYY-MM-dd', ee.String(feature.get('FIREDATE')));
+  var end = ee.Date.parse('YYYY-MM-dd', ee.String(feature.get('LASTUPDATE')));
+  var geom = feature.geometry().buffer(1000).bounds();
+  var id = ee.String(feature.get('COMMUNE'));
+
+  var s1_base = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(geom)
+    .filter(ee.Filter.contains({leftField: '.geo', rightValue: geom}))   // NUEVA: cobertura completa
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('orbitProperties_pass', ORBIT_USED))
+    .filter(ee.Filter.eq('resolution_meters', 10))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VH'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation','VV'));
+
+  // PRE: Buscamos hacia atrás en el tiempo (Orden Descendente: false). Rango amplio de 180 días.
+  var pre_raw = s1_base.filterDate(start.advance(-180,'day'), start)
+    .sort('system:time_start', false);
+    
+  // POST: Buscamos hacia adelante en el tiempo (Orden Ascendente: true) desde el día +5.
+  var post_raw = s1_base.filterDate(end.advance(5,'day'), end.advance(185,'day'))
+    .sort('system:time_start', true);
+
+  // Aplicamos filtros y limitamos el resultado a la PRIMERA imágen única que cumpla la condición
+  var pre = filterDryImages(pre_raw, geom)
+    .map(toGamma0_RTC).map(removeBorderNoise).map(leeFilter)
+    .limit(1);
+
+  var post = filterDryImages(post_raw, geom)
+    .map(toGamma0_RTC).map(removeBorderNoise).map(leeFilter)
+    .limit(1);
+
+  return {
+    incendioId: id,
+    geom: geom,
+    preCollection: pre,
+    postCollection: post,
+    numPre: pre.size(),
+    numPost: post.size()
+  };
+};
+
+// LOOP CLIENTE
+var incendios_procesados = [];
+var lista = perimetros.toList(perimetros.size());
+var n = lista.size().getInfo();
+
+for (var i = 0; i < n; i++) {
+  var feat = ee.Feature(lista.get(i));
+  var result = procesarFuego(feat);
+  var numPre = result.numPre.getInfo();
+  var numPost = result.numPost.getInfo();
+
+  // Controlamos que se haya encontrado la imagen para ambos estados
+  if (numPre > 0 && numPost > 0) {
+    // Extraemos las fechas de las imágenes exactas seleccionadas para mostrarlas en la consola
+    var fechaPre = ee.Image(result.preCollection.first()).date().format('YYYY-MM-dd').getInfo();
+    var fechaPost = ee.Image(result.postCollection.first()).date().format('YYYY-MM-dd').getInfo();
+    
+    incendios_procesados.push({
+      id: result.incendioId.getInfo(),
+      geom: result.geom,
+      pre: result.preCollection,
+      post: result.postCollection
+    });
+    
+    // Imprime en consola el ID del incendio junto con los días exactos de las capturas satelitales
+    print('✔', result.incendioId, '|| IMAGEN PRE:', fechaPre, '|| IMAGEN POST:', fechaPost);
+  } else {
+    print('✘', result.incendioId, 'Insuficientes imágenes que cumplan el criterio de sequía absoluta.');
+  }
+}
+
+// =============================================================================
+// BLOQUE 2: ÍNDICES, TEXTURAS Y VARIABILIDAD ESPACIAL
+// =============================================================================
+
+// 1. MEDIANAS TEMPORALES (Sigue funcionando idéntico con colecciones de 1 imagen)
+var calcularMedianas = function(incendio) {
+  var preMediana = incendio.pre
+    .select(['VH_gamma0_filtered','VV_gamma0_filtered'])
+    .median();
+
+  var postMediana = incendio.post
+    .select(['VH_gamma0_filtered','VV_gamma0_filtered'])
+    .median();
+
+  return {
+    id: incendio.id,
+    geom: incendio.geom,
+    preMediana: preMediana,
+    postMediana: postMediana
+  };
+};
+
+// 2. INGENIERÍA DE VARIABLES
+var calcularTodo = function(m) {
+
+  var pre_vh = m.preMediana.select('VH_gamma0_filtered');
+  var pre_vv = m.preMediana.select('VV_gamma0_filtered');
+  var post_vh = m.postMediana.select('VH_gamma0_filtered');
+  var post_vv = m.postMediana.select('VV_gamma0_filtered');
+
+  var pre_VH_dB = pre_vh.rename('pre_VH_dB');
+  var pre_VV_dB = pre_vv.rename('pre_VV_dB');
+
+  // --- 2.1. CAMBIOS EN dB ---
+  var DeltaVH = post_vh.subtract(pre_vh).rename('Delta_VH_dB');
+  var DeltaVV = post_vv.subtract(pre_vv).rename('Delta_VV_dB');
+
+  // --- 2.2. CONVERSIÓN A LINEAL ---
+  var pre_vh_lin  = ee.Image.constant(10).pow(pre_vh.divide(10));
+  var pre_vv_lin  = ee.Image.constant(10).pow(pre_vv.divide(10));
+  var post_vh_lin = ee.Image.constant(10).pow(post_vh.divide(10));
+  var post_vv_lin = ee.Image.constant(10).pow(post_vv.divide(10));
+
+  // --- 2.3. DELTA SPAN ---
+  var span_pre  = pre_vv_lin.add(pre_vh_lin);
+  var span_post = post_vv_lin.add(post_vh_lin);
+  var Delta_SPAN = span_post.divide(span_pre.max(1e-12))
+    .log10().multiply(10)
+    .rename('Delta_SPAN_dB');
+
+  // --- 2.4. ÍNDICES DE SEVERIDAD Y DEGRADACIÓN ---
+
+  // RBR VH
+  var RBR_VH = pre_vh_lin.subtract(post_vh_lin)
+    .divide(pre_vh_lin.add(post_vh_lin).max(1e-12))
+    .rename('RBR_VH_Lin');
+
+  // RBR VV
+  var RBR_VV = pre_vv_lin.subtract(post_vv_lin)
+    .divide(pre_vv_lin.add(post_vv_lin).max(1e-12))
+    .rename('RBR_VV_Lin');
+
+  // RFDI (Radar Forest Degradation Index)
+  var RFDI_pre  = pre_vv_lin.subtract(pre_vh_lin)
+    .divide(pre_vv_lin.add(pre_vh_lin).max(1e-12));
+  var RFDI_post = post_vv_lin.subtract(post_vh_lin)
+    .divide(post_vv_lin.add(post_vh_lin).max(1e-12));
+  var Delta_RFDI = RFDI_post.subtract(RFDI_pre).rename('Delta_RFDI');
+
+  // Delta RVI (Kim & Van Zyl 2009)
+  var RVI_pre  = pre_vh_lin.multiply(4)
+    .divide(pre_vv_lin.add(pre_vh_lin).max(1e-12));
+  var RVI_post = post_vh_lin.multiply(4)
+    .divide(post_vv_lin.add(post_vh_lin).max(1e-12));
+  var Delta_RVI = RVI_post.subtract(RVI_pre).rename('Delta_RVI');
+
+  // --- 2.5. VARIABILIDAD ESPACIAL ---
+  var kernel30 = ee.Kernel.circle({radius: 3, units: 'pixels', normalize: false});
+  var kernel70 = ee.Kernel.circle({radius: 7, units: 'pixels', normalize: false});
+
+  var std30 = DeltaVH.reduceNeighborhood({
+    reducer: ee.Reducer.stdDev(),
+    kernel: kernel30
+  }).rename('STD30_DeltaVH');
+
+  var std70 = DeltaVH.reduceNeighborhood({
+    reducer: ee.Reducer.stdDev(),
+    kernel: kernel70
+  }).rename('STD70_DeltaVH');
+
+  // --- 2.6. TEXTURAS GLCM ---
+  var delta_for_glcm = DeltaVH.rename('DeltaVH');
+
+  var norm = delta_for_glcm
+    .clamp(-10, 5)
+    .subtract(-10)
+    .divide(15)
+    .multiply(255)
+    .uint8();
+
+  var glcm5 = norm.glcmTexture({size: 2});
+  var tex5 = ee.Image([
+    glcm5.select('DeltaVH_contrast').rename('GLCM5_contrast'),
+    glcm5.select('DeltaVH_ent').rename('GLCM5_entropy'),
+    glcm5.select('DeltaVH_var').rename('GLCM5_variance')
+  ]);
+
+  // --- 2.7. STACK FINAL (14 bandas) ---
+  var finalImg = ee.Image([
+    DeltaVH,
+    DeltaVV,
+    Delta_SPAN,
+    RBR_VH,
+    RBR_VV,
+    Delta_RFDI,
+    Delta_RVI,
+    std30,
+    std70,
+    tex5,
+    pre_VH_dB,
+    pre_VV_dB
+  ]);
+
+  return {
+    id: m.id,
+    geom: m.geom,
+    imagen: finalImg
+  };
+};
+
+// 3. EJECUCIÓN Y EXPORTACIÓN
+for (var i = 0; i < incendios_procesados.length; i++) {
+
+  var datosIncendio = incendios_procesados[i];
+  var med = calcularMedianas(datosIncendio);
+  var fin = calcularTodo(med);
+
+  var id_short = fin.id.substring(0, 40);
+
+  Export.image.toDrive({
+    image: fin.imagen.toFloat(),
+    description: 'TFM_S1_' + id_short,
+    folder: "EXPORT_S1_TFM_v4",
+    scale: 10,
+    region: fin.geom,
+    crs: 'EPSG:25830',
+    fileFormat: 'GeoTIFF',
+    maxPixels: 1e10
+  });
+
+  print('🚀 Export v2.2 enviado:', fin.id);
+}
+
+print('🔥 PROCESAMIENTO v2.2 COMPLETADO 🔥');

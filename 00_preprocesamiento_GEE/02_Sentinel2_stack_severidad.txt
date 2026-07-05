@@ -1,0 +1,149 @@
+// =============================================================================
+// SENTINEL-2 ULTIMATE: STACK SEVERIDAD v2
+// =============================================================================
+// CAMBIOS v2 respecto a v1:
+//   - Ventana pre reducida de 60 → 45 días (mitiga ruido fenológico por
+//     agostamiento estival en CyL; Soverel 2010, Quintano 2022)
+//   - dNDVI añadido como índice óptico complementario
+//   - pre_NBR, pre_NDMI, pre_BAIS2, pre_NDVI como bandas independientes
+//     (calibran el delta sobre el estado inicial; Soverel 2010, Veraverbeke 2010)
+//
+// Bandas exportadas (12):
+//   Deltas:    dNBR, RBR, RdNBR, dNDMI, dBAIS2, dNBRplus, dNDVI
+//   Pre-fire:  pre_NBR, pre_NDMI, pre_BAIS2, pre_NDVI
+//   Topo:      Slope
+// =============================================================================
+
+var table = ee.FeatureCollection("Capa_de_Perimetros");
+
+// 1. FUNCIONES TÉCNICAS
+
+function maskClouds(img) {
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  return img.updateMask(clouds.lt(40));
+}
+
+function addIndices(img) {
+  var nbr  = img.normalizedDifference(['B8A', 'B12']).rename('NBR');
+  var ndmi = img.normalizedDifference(['B8A', 'B11']).rename('NDMI');
+  var ndvi = img.normalizedDifference(['B8A', 'B4']).rename('NDVI');  // ← NUEVO v2
+  var imgScaled = img.divide(10000);
+
+  var bais2 = imgScaled.expression(
+    '(1 - sqrt((B6 * B7 * B8A) / B4)) * ((B12 - B8A) / sqrt(B12 + B8A) + 1)', {
+      'B4':  imgScaled.select('B4'),
+      'B6':  imgScaled.select('B6'),
+      'B7':  imgScaled.select('B7'),
+      'B8A': imgScaled.select('B8A'),
+      'B12': imgScaled.select('B12')
+  }).rename('BAIS2');
+
+  // NBR+ sobre imagen escalada (Ngadze et al. 2022)
+  var nbrPlus = imgScaled.expression(
+    '(B8A - B12 - B6) / (B8A + B12 + B6)', {
+      'B8A': imgScaled.select('B8A'),
+      'B12': imgScaled.select('B12'),
+      'B6':  imgScaled.select('B6')
+  }).rename('NBRplus');
+
+  return img.addBands([nbr, ndmi, ndvi, bais2, nbrPlus]);  // ← ndvi añadido
+}
+
+// 2. PROCESAMIENTO
+
+var procesarConBBoxS2 = function(feature) {
+  var fireStart   = ee.Date.parse('YYYY-MM-dd', feature.get('FIREDATE'));
+  var fireEnd     = ee.Date.parse('YYYY-MM-dd', feature.get('LASTUPDATE'));
+  var areaEstudio = feature.geometry().buffer(1000).bounds();
+
+  // DEM JAXA V4_1
+  var dem_raw = ee.ImageCollection("JAXA/ALOS/AW3D30/V4_1")
+    .select('DSM')
+    .mosaic()
+    .setDefaultProjection({ crs: 'EPSG:4326', scale: 30 });
+  var dem   = dem_raw.focal_mean(1, 'square', 'pixels').unmask(dem_raw);
+  var slope = ee.Terrain.slope(dem).rename('Slope');
+
+  // Colección S2 con máscara de nubes
+  var s2Col    = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                   .filterBounds(areaEstudio)
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80));
+  var s2Cloud = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY').filterBounds(areaEstudio);
+  var joined  = ee.Join.saveFirst('cloud_mask').apply({
+    primary:   s2Col,
+    secondary: s2Cloud,
+    condition: ee.Filter.equals({ leftField: 'system:index', rightField: 'system:index' })
+  });
+
+  // ← CAMBIO v2: ventana pre de 60 → 45 días (mitiga ruido fenológico estival)
+  var preImg = ee.ImageCollection(joined)
+    .filterDate(fireStart.advance(-45, 'day'), fireStart)
+    .map(maskClouds).map(addIndices).median();
+
+  var postImg = ee.ImageCollection(joined)
+    .filterDate(fireEnd.advance(5, 'day'), fireEnd.advance(45, 'day'))
+    .map(maskClouds).map(addIndices).median();
+
+  // --- VARIABLES DE SEVERIDAD (deltas) ---
+
+  var nbrPre   = preImg.select('NBR');
+  var dNBR_raw = nbrPre.subtract(postImg.select('NBR'));
+
+  // RBR (Parks et al. 2014)
+  var RBR = dNBR_raw.divide(nbrPre.add(1.001))
+    .clamp(-2, 2)
+    .multiply(1000)
+    .rename('RBR');
+
+  // RdNBR (Miller & Thode 2007)
+  var RdNBR = dNBR_raw.divide(nbrPre.abs().sqrt().add(0.001))
+    .clamp(-2, 2)
+    .multiply(1000)
+    .rename('RdNBR');
+
+  // dNBR ×1000 (Key & Benson 2006)
+  var dNBR = dNBR_raw.multiply(1000).rename('dNBR');
+
+  var dNDMI  = preImg.select('NDMI').subtract(postImg.select('NDMI')).rename('dNDMI');
+  var dBAIS2 = postImg.select('BAIS2').subtract(preImg.select('BAIS2')).rename('dBAIS2');
+  var dNDVI  = preImg.select('NDVI').subtract(postImg.select('NDVI')).rename('dNDVI');  // ← NUEVO v2
+
+  var dNBRplus = preImg.select('NBRplus')
+    .subtract(postImg.select('NBRplus'))
+    .multiply(1000)
+    .rename('dNBRplus');
+
+  // ← NUEVO v2: bandas pre-fire como variables independientes
+  // Calibran el delta sobre el estado inicial (Soverel 2010, Veraverbeke 2010)
+  var pre_NBR   = preImg.select('NBR').rename('pre_NBR');
+  var pre_NDMI  = preImg.select('NDMI').rename('pre_NDMI');
+  var pre_NDVI  = preImg.select('NDVI').rename('pre_NDVI');
+  var pre_BAIS2 = preImg.select('BAIS2').rename('pre_BAIS2');
+
+  // Stack final: 12 bandas
+  return dNBR.addBands([RBR, RdNBR, dNDMI, dBAIS2, dNBRplus, dNDVI,
+                        pre_NBR, pre_NDMI, pre_BAIS2, pre_NDVI, slope])
+    .set('COMMUNE', feature.get('COMMUNE'))
+    .set('BBOX', areaEstudio);
+};
+
+// 3. EXPORTACIÓN
+
+var resultadosS2 = table.map(procesarConBBoxS2);
+var listaS2      = resultadosS2.toList(resultadosS2.size());
+
+for (var i = 0; i < resultadosS2.size().getInfo(); i++) {
+  var img    = ee.Image(listaS2.get(i));
+  var nombre = img.get('COMMUNE').getInfo() || 'Incendio_' + i;
+
+  Export.image.toDrive({
+    image: img.select(['dNBR','RBR','RdNBR','dNDMI','dBAIS2','dNBRplus','dNDVI',
+                       'pre_NBR','pre_NDMI','pre_BAIS2','pre_NDVI','Slope']).toFloat(),
+    description: 'TFM_S2_v2_' + nombre.replace(/[^a-zA-Z0-9]/g, '_'),
+    folder: 'EXPORT_S2_TFM_v2',
+    region: ee.Geometry(img.get('BBOX')),
+    scale: 10,
+    crs: 'EPSG:25830',
+    maxPixels: 1e13
+  });
+}
