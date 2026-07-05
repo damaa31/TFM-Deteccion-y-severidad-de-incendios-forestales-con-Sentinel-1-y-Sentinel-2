@@ -6,8 +6,8 @@ Código del Trabajo Fin de Máster que evalúa el radar de banda C (Sentinel-1) 
 Los scripts están numerados según el orden de ejecución del flujo de trabajo.
 
 ### 00_preprocesamiento_GEE — Google Earth Engine (JavaScript)
-- `01_sentinel1_preproceso_stack.txt` — Preprocesamiento y stack de Sentinel-1
-- `02_sentinel2_stack_severidad.txt` — Composición y stack de Sentinel-2
+- `01_sentinel1_preproceso_stack.js` — Preprocesamiento y stack de Sentinel-1
+- `02_sentinel2_stack_severidad.js` — Composición y stack de Sentinel-2
 
 ### 01_deteccion — Objetivo 1 (R)
 - `03_puntos_aleatorios_fotointerpretacion.R` — Generación de puntos para fotointerpretación
